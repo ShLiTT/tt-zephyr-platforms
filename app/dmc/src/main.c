@@ -28,6 +28,7 @@
 #include <tenstorrent/event.h>
 #include <tenstorrent/jtag_bootrom.h>
 #include <tenstorrent/tt_smbus_regs.h>
+#include <tenstorrent/read_only_table.h>
 
 #define RESET_UNIT_ARC_PC_CORE_0                0x80030C00
 
@@ -42,6 +43,11 @@ struct bh_chip BH_CHIPS[BH_CHIP_COUNT] = {DT_FOREACH_PROP_ELEM(DT_PATH(chips), c
 static const struct gpio_dt_spec board_fault_led =
 	GPIO_DT_SPEC_GET_OR(DT_PATH(board_fault_led), gpios, {0});
 static const struct device *const ina228 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina228));
+
+#if IS_ENABLED(CONFIG_TT_FAN_CTRL)
+static uint8_t auto_fan_speed[BH_CHIP_COUNT] = { 0 };  /* per–chip */
+static uint8_t  forced_fan_speed  = 0;                 /* 0-100 % */
+#endif
 
 int update_fw(void)
 {
@@ -120,9 +126,12 @@ void process_cm2dm_message(struct bh_chip *chip)
 			bharc_smbus_word_data_write(&chip->config.arc, CMFW_SMBUS_PING, 0xA5A5);
 			break;
 		case kCm2DmMsgIdFanSpeedUpdate:
-			if (IS_ENABLED(CONFIG_TT_FAN_CTRL)) {
-				set_fan_speed((uint8_t)message.data & 0xFF);
-			}
+			uint8_t fan_speed = (uint8_t)message.data & 0xFF;
+			int chip_index = is_p300_left_chip() ? 1 : 0;
+			auto_fan_speed[chip_index] = fan_speed;
+			break;
+		case kCm2DmMsgIdForcedFanSpeedUpdate:
+			forced_fan_speed = message.data;
 			break;
 		case kCm2DmMsgIdReady:
 			chip->data.arc_needs_init_msg = true;
@@ -507,8 +516,18 @@ int main(void)
 			}
 		}
 
-		ARRAY_FOR_EACH_PTR(BH_CHIPS, chip) {
-			process_cm2dm_message(chip);
+		// ARRAY_FOR_EACH_PTR(BH_CHIPS, chip) {
+		// 	process_cm2dm_message(chip);
+		// }
+		process_cm2dm_message(&BH_CHIPS[1]);
+
+		if (forced_fan_speed != 0) {
+			set_fan_speed(forced_fan_speed);
+			printk("forced fan speed: %d\n", forced_fan_speed);
+		} else {
+			uint8_t max_fan_speed = MAX(auto_fan_speed[0], auto_fan_speed[1]);
+			set_fan_speed(max_fan_speed);
+			printk("auto fan speed: %d\n", max_fan_speed);
 		}
 
 		/*
