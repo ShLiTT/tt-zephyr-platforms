@@ -120,6 +120,16 @@ void UpdateFanSpeedRequest(uint32_t fan_speed)
 	EnqueueCm2DmMsg(&msg);
 }
 
+// add forced fan speed message
+void UpdateForcedFanSpeedRequest(uint32_t fan_speed)
+{
+	Cm2DmMsg msg = {
+		.msg_id = kCm2DmMsgIdForcedFanSpeedUpdate,
+		.data = fan_speed,
+	};
+	EnqueueCm2DmMsg(&msg);
+}
+
 void Dm2CmReadyRequest(void)
 {
 	/* Send a message to dmfw to indicate ready to receive messages */

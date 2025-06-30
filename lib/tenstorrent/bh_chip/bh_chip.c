@@ -182,8 +182,10 @@ void pgood_change_detected(const struct device *dev, struct gpio_callback *cb, u
 	/* TODO: could setup rising interrupt only after falling triggered */
 	if (gpio_pin_get_dt(&chip->config.pgood)) {
 		chip->data.pgood_rise_triggered = true;
+		chip->data.pgood_rise_count++;
 	} else {
 		chip->data.pgood_fall_triggered = true;
+		chip->data.pgood_fall_count++;
 	}
 	tt_event_post(TT_EVENT_WAKE);
 }
@@ -243,4 +245,5 @@ void handle_pgood_event(struct bh_chip *chip, struct gpio_dt_spec board_fault_le
 		}
 		chip->data.pgood_rise_triggered = false;
 	}
+
 }
