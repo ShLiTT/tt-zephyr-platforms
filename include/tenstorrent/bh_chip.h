@@ -68,6 +68,9 @@ struct bh_chip_data {
 	bool pgood_severe_fault;
 	int64_t pgood_last_trip_ms;
 
+	int64_t pgood_fall_count;
+	int64_t pgood_rise_count;
+
 	/* Max allowable time between pings from SMC in ms */
 	uint32_t auto_reset_timeout;
 

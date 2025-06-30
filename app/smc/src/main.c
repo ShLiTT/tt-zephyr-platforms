@@ -75,6 +75,8 @@ int main(void)
 	Dm2CmReadyRequest();
 
 	while (1) {
+		// write to a reset_unit.scratch_21 to test if fw is booting
+		WriteReg(RESET_UNIT_SCRATCH_RAM_REG_ADDR(21), 0xdeadbeef);
 		k_msleep(CONFIG_TT_BH_ARC_WDT_FEED_INTERVAL);
 		wdt_feed(wdt0, 0);
 	}

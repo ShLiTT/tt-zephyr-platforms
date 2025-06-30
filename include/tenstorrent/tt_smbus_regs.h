@@ -23,7 +23,7 @@ enum CMFWSMBusReg {
 	/* WO, 16 bits. Write with 0xA5A5 to respond to CMFW request `kCm2DmMsgIdPing` */
 	CMFW_SMBUS_PING = 0x21,
 	/* WO, 16 bits. Write with fan speed to responsd to CMFW request
-	 * `kCm2DmMsgIdFanSpeedUpdate`
+	 * `kCm2DmMsgIdFanSpeedUpdate` or `kCm2DmMsgIdForcedFanSpeedUpdate`
 	 */
 	CMFW_SMBUS_FAN_RPM = 0x23,
 	/* WO, 16 bits. Write with input power limit for board */

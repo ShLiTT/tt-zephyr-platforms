@@ -88,6 +88,8 @@ static void update_fan_speed(void)
 	UpdateFanSpeedRequest(fan_speed);
 }
 
+// when cm sends 0xffffffff to dm, set fan_speed to unforced (dm)
+
 uint16_t GetFanRPM(void)
 {
 	return fan_rpm;
@@ -95,6 +97,7 @@ uint16_t GetFanRPM(void)
 
 void SetFanRPM(uint16_t rpm)
 {
+	printk("SetFanRPM: %u\n", rpm);
 	fan_rpm = rpm;
 }
 
@@ -135,11 +138,14 @@ static uint8_t force_fan_speed(uint32_t msg_code, const struct request *request,
 	if (tt_bh_fwtable_get_fw_table(fwtable_dev)->feature_enable.fan_ctrl_en) {
 		if (request->data[1] == 0xFFFFFFFF) { /* unforce */
 			k_timer_start(&fan_ctrl_update_timer, K_MSEC(fan_ctrl_update_interval),
-				      K_MSEC(fan_ctrl_update_interval));
+				      K_MSEC(fan_ctrl_update_interval)); 
+			UpdateForcedFanSpeedRequest(0); // unforce fan speed 
+			printk("added unforced fan speed request\n");
 		} else { /* force */
 			k_timer_stop(&fan_ctrl_update_timer);
 			fan_speed = request->data[1];
-			UpdateFanSpeedRequest(fan_speed);
+			UpdateForcedFanSpeedRequest(fan_speed);
+			printk("added forced fan speed request\n");
 		}
 		return 0;
 	}
