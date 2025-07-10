@@ -287,6 +287,7 @@ int main(void)
 		}
 	}
 
+#if 0
 	ARRAY_FOR_EACH_PTR(BH_CHIPS, chip) {
 		if (chip->config.arc.smbus.bus == NULL) {
 			continue;
@@ -295,6 +296,7 @@ int main(void)
 		tt_smbus_stm32_set_abort_ptr(chip->config.arc.smbus.bus,
 					     &((&chip->data)->bus_cancel_flag));
 	}
+#endif
 
 	bist_rc = 0;
 	if (IS_ENABLED(CONFIG_TT_BIST)) {
@@ -533,9 +535,10 @@ int main(void)
 			}
 		}
 
-		ARRAY_FOR_EACH_PTR(BH_CHIPS, chip) {
-			process_cm2dm_message(chip);
-		}
+		// ARRAY_FOR_EACH_PTR(BH_CHIPS, chip) {
+		// 	process_cm2dm_message(chip);
+		// }
+		process_cm2dm_message(&BH_CHIPS[1]);
 
 		if (forced_fan_speed != 0) {
 			set_fan_speed(forced_fan_speed);
