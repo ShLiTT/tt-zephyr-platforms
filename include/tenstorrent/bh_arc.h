@@ -17,10 +17,10 @@ typedef enum {
 	kCm2DmMsgIdResetReq = 1,
 	kCm2DmMsgIdPing = 2,
 	kCm2DmMsgIdFanSpeedUpdate = 3,
-	kCm2DmMsgIdForcedFanSpeedUpdate = 4,
-	kCm2DmMsgIdReady = 5,
-	kCm2DmMsgIdAutoResetTimeoutUpdate = 6,
-	kCm2DmMsgTelemHeartbeatUpdate = 7,
+	kCm2DmMsgIdReady = 4,
+	kCm2DmMsgIdAutoResetTimeoutUpdate = 5,
+	kCm2DmMsgTelemHeartbeatUpdate = 6,
+	kCm2DmMsgIdForcedFanSpeedUpdate = 7,
 } Cm2DmMsgId;
 
 typedef struct dmStaticInfo {

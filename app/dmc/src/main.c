@@ -45,7 +45,7 @@ static const struct gpio_dt_spec board_fault_led =
 static const struct device *const ina228 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina228));
 
 #if IS_ENABLED(CONFIG_TT_FAN_CTRL)
-static uint8_t auto_fan_speed[BH_CHIP_COUNT] = { 0 };  /* per–chip */
+static uint8_t auto_fan_speed[BH_CHIP_COUNT] = { 35 };  /* per–chip */
 static uint8_t  forced_fan_speed  = 0;                 /* 0-100 % */
 #endif
 
@@ -518,18 +518,16 @@ int main(void)
 			}
 		}
 
-		// ARRAY_FOR_EACH_PTR(BH_CHIPS, chip) {
-		// 	process_cm2dm_message(chip);
-		// }
-		process_cm2dm_message(&BH_CHIPS[1]);
+		ARRAY_FOR_EACH_PTR(BH_CHIPS, chip) {
+			process_cm2dm_message(chip);
+		}
 
+		/* Set fan speed based on forced or auto fan speed msgs */
 		if (forced_fan_speed != 0) {
 			set_fan_speed(forced_fan_speed);
-			printk("forced fan speed: %d\n", forced_fan_speed);
 		} else {
 			uint8_t max_fan_speed = MAX(auto_fan_speed[0], auto_fan_speed[1]);
 			set_fan_speed(max_fan_speed);
-			printk("auto fan speed: %d\n", max_fan_speed);
 		}
 
 		/*

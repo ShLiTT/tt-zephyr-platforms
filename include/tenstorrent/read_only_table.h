@@ -1,14 +1,11 @@
 /*
- * Public API wrapper for the read-only SPIROM configuration table.
+ * Copyright (c) 2025 Tenstorrent AI ULC
  *
- * NOTE: The real implementation lives in lib/tenstorrent/bh_arc/read_only_table.c
- * and its private header within the same directory.  We avoid including that
- * internal header here so that application code does not depend on the
- * nanopb-generated files.  Only forward declarations and enums required by
- * callers are provided.
+ * SPDX-License-Identifier: Apache-2.0
  */
-#ifndef TT_READ_ONLY_TABLE_PUBLIC_H_
-#define TT_READ_ONLY_TABLE_PUBLIC_H_
+
+#ifndef TENSTORRENT_READ_ONLY_TABLE_H_
+#define TENSTORRENT_READ_ONLY_TABLE_H_
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -17,31 +14,22 @@
 extern "C" {
 #endif
 
-/* Forward-declare the protobuf structure so users can keep a const pointer if
- * they need to pass it around.  The full definition is private to the bh_arc
- * library. */
+/* Enum describing PCB/board types (must match bh_arc implementation) */
+typedef enum {
+    PcbTypeOrion   = 0,
+    PcbTypeP100    = 1,
+    PcbTypeP150    = 2,
+    PcbTypeP300    = 3,
+    PcbTypeUBB     = 4,
+    PcbTypeUnknown = 0xFF
+} PcbType;
+
+/* Forward-declare the nanopb-generated structure so callers can hold a const* */
 typedef struct ReadOnly ReadOnly;
 
-/* Enumeration of supported PCB types.  Keep in sync with bh_arc implementation. */
-typedef enum {
-    TT_PCB_TYPE_ORION   = 0,
-    TT_PCB_TYPE_P100    = 1,
-    TT_PCB_TYPE_P150    = 2,
-    TT_PCB_TYPE_P300    = 3,
-    TT_PCB_TYPE_UBB     = 4,
-    TT_PCB_TYPE_UNKNOWN = 0xFF
-} tt_pcb_type_t;
-
-/* Load the table from SPIROM into an internal static structure.
- * Returns 0 on success or negative error code.
- */
-int      load_read_only_table(uint8_t *buffer_space, uint32_t buffer_size);
-
-/* Get a pointer to the decoded table (const – read-only). */
+int       load_read_only_table(uint8_t *buffer_space, uint32_t buffer_size);
 const ReadOnly *get_read_only_table(void);
-
-/* Query utilities */
-tt_pcb_type_t get_pcb_type(void);
+PcbType    get_pcb_type(void);
 
 /*
  * For firmware that does not link the full bh_arc library (e.g. DMC), provide
@@ -57,11 +45,10 @@ static inline bool is_p300_left_chip(void)
     return ((*((volatile uint32_t *)TT_RESET_UNIT_STRAP_REG_L)) & BIT(6)) != 0;
 #undef TT_RESET_UNIT_STRAP_REG_L
 }
-
-uint32_t      get_asic_location(void);
+uint32_t   get_asic_location(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* TT_READ_ONLY_TABLE_PUBLIC_H_ */ 
+#endif /* TENSTORRENT_READ_ONLY_TABLE_H_ */ 
