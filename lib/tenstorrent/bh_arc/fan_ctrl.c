@@ -140,12 +140,10 @@ static uint8_t force_fan_speed(uint32_t msg_code, const struct request *request,
 			k_timer_start(&fan_ctrl_update_timer, K_MSEC(fan_ctrl_update_interval),
 				      K_MSEC(fan_ctrl_update_interval)); 
 			UpdateForcedFanSpeedRequest(0); // unforce fan speed 
-			printk("added unforced fan speed request\n");
 		} else { /* force */
 			k_timer_stop(&fan_ctrl_update_timer);
 			fan_speed = request->data[1];
 			UpdateForcedFanSpeedRequest(fan_speed);
-			printk("added forced fan speed request\n");
 		}
 		return 0;
 	}
