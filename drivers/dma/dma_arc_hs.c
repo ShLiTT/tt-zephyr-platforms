@@ -80,6 +80,16 @@ static inline void dma_arc_hs_start_hw(uint32_t dma_ch, const void *p_src, void 
 	arc_write_aux(DMA_C_LEN_AUX, len);
 }
 
+/* Queue a transfer on the currently selected channel (for multi-block) */
+static inline void dma_arc_hs_next_hw(const void *p_src, void *p_dst, uint32_t len, uint32_t attr)
+{
+	/* Don't write DMA_C_CHAN_AUX - use currently selected channel */
+	arc_write_aux(DMA_C_SRC_AUX, (uint32_t)p_src);
+	arc_write_aux(DMA_C_DST_AUX, (uint32_t)p_dst);
+	arc_write_aux(DMA_C_ATTR_AUX, attr);
+	arc_write_aux(DMA_C_LEN_AUX, len);
+}
+
 static inline uint32_t dma_arc_hs_get_handle_hw(void)
 {
 	return arc_read_aux(DMA_C_HANDLE_AUX);
@@ -116,15 +126,26 @@ LOG_MODULE_REGISTER(dma_arc, CONFIG_DMA_LOG_LEVEL);
 #define ARC_DMA_MAX_DESCRIPTORS 256
 #define ARC_DMA_ATOMIC_WORDS    ATOMIC_BITMAP_SIZE(ARC_DMA_MAX_CHANNELS)
 
+/* Channel states */
+enum arc_dma_channel_state {
+	ARC_DMA_IDLE = 0,
+	ARC_DMA_PREPARED,
+	ARC_DMA_ACTIVE,
+	ARC_DMA_SUSPENDED,
+};
+
 struct arc_dma_channel {
 	uint32_t id;
 	bool in_use;
 	bool active;
+	enum arc_dma_channel_state state;
 	dma_callback_t callback;
 	void *callback_arg;
 	struct dma_config config;
 	uint32_t handle;
-	struct k_spinlock hw_lock; /* Per-channel hardware access lock */
+	uint32_t block_count;        /* Total number of blocks */
+	uint32_t blocks_completed;   /* Number of blocks completed */
+	struct k_spinlock hw_lock;   /* Per-channel hardware access lock */
 };
 
 struct arc_dma_config {
@@ -142,11 +163,9 @@ struct arc_dma_data {
 	struct arc_dma_channel channels[ARC_DMA_MAX_CHANNELS];
 	atomic_t channels_atomic[ARC_DMA_ATOMIC_WORDS];
 	struct k_spinlock lock;
-	struct k_thread completion_thread;
-	k_tid_t completion_thread_id;
-	bool completion_thread_running;
-
-	K_KERNEL_STACK_MEMBER(completion_stack, 1024);
+	struct k_work_delayable completion_work;
+	const struct device *dev;
+	bool work_initialized;
 };
 
 static int dma_arc_hs_config(const struct device *dev, uint32_t channel, struct dma_config *config)
@@ -166,14 +185,25 @@ static int dma_arc_hs_config(const struct device *dev, uint32_t channel, struct 
 		return -EINVAL;
 	}
 
-	if (config->block_count != 1) {
-		LOG_ERR("Only single block transfers supported");
-		return -ENOTSUP;
+	if (config->block_count == 0) {
+		LOG_ERR("block_count must be at least 1");
+		return -EINVAL;
+	}
+
+	if (config->block_count > dev_config->descriptors) {
+		LOG_ERR("block_count %u exceeds max descriptors %u",
+			config->block_count, dev_config->descriptors);
+		return -EINVAL;
 	}
 
 	if (config->channel_direction != MEMORY_TO_MEMORY) {
 		LOG_ERR("Only memory-to-memory transfers supported");
 		return -ENOTSUP;
+	}
+
+	if (!config->head_block) {
+		LOG_ERR("head_block cannot be NULL");
+		return -EINVAL;
 	}
 
 	key = k_spin_lock(&data->lock);
@@ -192,6 +222,7 @@ static int dma_arc_hs_config(const struct device *dev, uint32_t channel, struct 
 	chan->config = *config;
 	chan->callback = config->dma_callback;
 	chan->callback_arg = config->user_data;
+	chan->state = ARC_DMA_PREPARED;
 
 	k_spin_unlock(&data->lock, key);
 
@@ -206,6 +237,7 @@ static int dma_arc_hs_start(const struct device *dev, uint32_t channel)
 	struct arc_dma_channel *chan;
 	struct dma_block_config *block;
 	uint32_t attr;
+	uint32_t block_idx = 0;
 	k_spinlock_key_t key, hw_key;
 
 	if (channel >= dev_config->channels) {
@@ -240,18 +272,46 @@ static int dma_arc_hs_start(const struct device *dev, uint32_t channel)
 	/* Lock hardware access for this channel */
 	hw_key = k_spin_lock(&chan->hw_lock);
 
-	LOG_INF("Starting HW transfer: ch=%u, src=0x%x, dst=0x%x, size=%u", channel,
-		(uint32_t)block->source_address, (uint32_t)block->dest_address, block->block_size);
+	/* Queue all blocks in the scatter-gather list */
+	LOG_INF("Starting %u block(s) on channel %u", chan->config.block_count, channel);
+
+	/* Start first block */
+	LOG_DBG("Block %u: src=0x%x, dst=0x%x, size=%u", block_idx,
+		(uint32_t)block->source_address, (uint32_t)block->dest_address,
+		block->block_size);
 
 	dma_arc_hs_start_hw(channel, (const void *)block->source_address,
 			    (void *)block->dest_address, block->block_size, attr);
+	block_idx++;
+	block = block->next_block;
 
+	/* Queue remaining blocks using dma_next (channel already selected) */
+	while (block != NULL && block_idx < chan->config.block_count) {
+		LOG_DBG("Block %u: src=0x%x, dst=0x%x, size=%u", block_idx,
+			(uint32_t)block->source_address, (uint32_t)block->dest_address,
+			block->block_size);
+
+		dma_arc_hs_next_hw((const void *)block->source_address,
+				   (void *)block->dest_address, block->block_size, attr);
+		block_idx++;
+		block = block->next_block;
+	}
+
+	/* Get handle for the last block - when it completes, all blocks are done */
 	chan->handle = dma_arc_hs_get_handle_hw();
 	chan->active = true;
+	chan->state = ARC_DMA_ACTIVE;
+	chan->block_count = chan->config.block_count;
+	chan->blocks_completed = 0;
 
-	LOG_INF("HW transfer started: ch=%u, handle=%u", channel, chan->handle);
+	LOG_INF("HW transfer started: ch=%u, last_handle=%u, blocks=%u",
+		channel, chan->handle, chan->block_count);
 
 	k_spin_unlock(&chan->hw_lock, hw_key);
+
+	/* Schedule completion work to check for transfer completion */
+	k_work_schedule(&data->completion_work, K_MSEC(1));
+
 	k_spin_unlock(&data->lock, key);
 
 	LOG_DBG("Started DMA transfer on channel %u, handle %u", channel, chan->handle);
@@ -289,6 +349,7 @@ static int dma_arc_hs_stop(const struct device *dev, uint32_t channel)
 	hw_key = k_spin_lock(&chan->hw_lock);
 
 	chan->active = false;
+	chan->state = ARC_DMA_IDLE;
 	dma_arc_hs_clear_done_hw(chan->handle);
 
 	k_spin_unlock(&chan->hw_lock, hw_key);
@@ -320,8 +381,25 @@ static void dma_arc_hs_check_completion(const struct device *dev, uint32_t chann
 
 	if (done_status != 0) {
 		LOG_INF("Channel %u transfer completed, clearing done status", channel);
-		chan->active = false;
 		dma_arc_hs_clear_done_hw(chan->handle);
+
+		/* For cyclic transfers, keep channel active and restart */
+		if (chan->config.cyclic) {
+			struct dma_block_config *block = chan->config.head_block;
+			uint32_t attr = ARC_DMA_SET_DONE_ATTR | ARC_DMA_NP_ATTR;
+
+			LOG_INF("Cyclic transfer: restarting channel %u", channel);
+
+			/* Restart the transfer for cyclic mode */
+			dma_arc_hs_start_hw(channel, (const void *)block->source_address,
+					    (void *)block->dest_address, block->block_size, attr);
+			chan->handle = dma_arc_hs_get_handle_hw();
+			/* Channel remains active */
+		} else {
+			/* Non-cyclic transfer completes and goes idle */
+			chan->active = false;
+			chan->state = ARC_DMA_IDLE;
+		}
 
 		if (chan->callback) {
 			LOG_INF("Calling callback for channel %u", channel);
@@ -378,8 +456,26 @@ static int dma_arc_hs_get_status(const struct device *dev, uint32_t channel,
 			LOG_INF("Channel %u still busy, pending=%u", channel, stat->pending_length);
 		} else {
 			LOG_INF("Channel %u transfer completed, clearing done status", channel);
-			chan->active = false;
 			dma_arc_hs_clear_done_hw(chan->handle);
+
+			/* For cyclic transfers, keep channel active and restart */
+			if (chan->config.cyclic) {
+				struct dma_block_config *block = chan->config.head_block;
+				uint32_t attr = ARC_DMA_SET_DONE_ATTR | ARC_DMA_NP_ATTR;
+
+				LOG_INF("Cyclic transfer: restarting channel %u", channel);
+
+				/* Restart the transfer for cyclic mode */
+				dma_arc_hs_start_hw(channel, (const void *)block->source_address,
+						    (void *)block->dest_address, block->block_size,
+							attr);
+				chan->handle = dma_arc_hs_get_handle_hw();
+				/* Channel remains active */
+			} else {
+				/* Non-cyclic transfer completes and goes idle */
+				chan->active = false;
+				chan->state = ARC_DMA_IDLE;
+			}
 
 			if (chan->callback) {
 				LOG_INF("Calling callback for channel %u", channel);
@@ -467,6 +563,8 @@ static void dma_arc_hs_chan_release(const struct device *dev, uint32_t channel)
 
 static int dma_arc_hs_get_attribute(const struct device *dev, uint32_t type, uint32_t *value)
 {
+	const struct arc_dma_config *dev_config = dev->config;
+
 	switch (type) {
 	case DMA_ATTR_BUFFER_ADDRESS_ALIGNMENT:
 		*value = 4; /* 32-bit aligned */
@@ -478,7 +576,7 @@ static int dma_arc_hs_get_attribute(const struct device *dev, uint32_t type, uin
 		*value = 4; /* 32-bit aligned */
 		break;
 	case DMA_ATTR_MAX_BLOCK_COUNT:
-		*value = 1; /* Single block only */
+		*value = dev_config->descriptors; /* Limited by descriptor count */
 		break;
 	default:
 		return -ENOTSUP;
@@ -487,35 +585,151 @@ static int dma_arc_hs_get_attribute(const struct device *dev, uint32_t type, uin
 	return 0;
 }
 
-static void dma_arc_hs_completion_thread(void *arg1, void *arg2, void *arg3)
+static int dma_arc_hs_suspend(const struct device *dev, uint32_t channel)
 {
-	const struct device *dev = (const struct device *)arg1;
-	const struct arc_dma_config *config = dev->config;
+	const struct arc_dma_config *dev_config = dev->config;
 	struct arc_dma_data *data = dev->data;
-	int i;
+	struct arc_dma_channel *chan;
+	k_spinlock_key_t key, hw_key;
 
-	ARG_UNUSED(arg2);
-	ARG_UNUSED(arg3);
-
-	LOG_DBG("DMA completion thread started");
-
-	while (data->completion_thread_running) {
-		/* Check all channels for completion */
-		for (i = 0; i < config->channels; i++) {
-			dma_arc_hs_check_completion(dev, i);
-		}
-
-		/* Sleep for 10ms between checks - similar to old polling interval */
-		k_sleep(K_MSEC(10));
+	if (channel >= dev_config->channels) {
+		LOG_ERR("Invalid channel %u", channel);
+		return -EINVAL;
 	}
 
-	LOG_DBG("DMA completion thread stopped");
+	key = k_spin_lock(&data->lock);
+	chan = &data->channels[channel];
+
+	if (!chan->in_use) {
+		LOG_ERR("Channel %u not allocated", channel);
+		k_spin_unlock(&data->lock, key);
+		return -EINVAL;
+	}
+
+	/* Validate channel state - can only suspend active channels */
+	if (chan->state != ARC_DMA_ACTIVE) {
+		LOG_ERR("Channel %u not active, cannot suspend (state=%d)", channel, chan->state);
+		k_spin_unlock(&data->lock, key);
+		return -EINVAL;
+	}
+
+	/* Lock hardware access for this channel */
+	hw_key = k_spin_lock(&chan->hw_lock);
+
+	/* Note: ARC DMA doesn't have hardware suspend support.
+	 * We mark it as suspended but the hardware transfer may complete.
+	 * This is a software-only state change.
+	 */
+	chan->state = ARC_DMA_SUSPENDED;
+	chan->active = false;
+
+	k_spin_unlock(&chan->hw_lock, hw_key);
+	k_spin_unlock(&data->lock, key);
+
+	LOG_DBG("Suspended DMA channel %u", channel);
+	return 0;
+}
+
+static int dma_arc_hs_resume(const struct device *dev, uint32_t channel)
+{
+	const struct arc_dma_config *dev_config = dev->config;
+	struct arc_dma_data *data = dev->data;
+	struct arc_dma_channel *chan;
+	struct dma_block_config *block;
+	uint32_t attr;
+	k_spinlock_key_t key, hw_key;
+
+	if (channel >= dev_config->channels) {
+		LOG_ERR("Invalid channel %u", channel);
+		return -EINVAL;
+	}
+
+	key = k_spin_lock(&data->lock);
+	chan = &data->channels[channel];
+
+	if (!chan->in_use) {
+		LOG_ERR("Channel %u not allocated", channel);
+		k_spin_unlock(&data->lock, key);
+		return -EINVAL;
+	}
+
+	/* Validate channel state - can only resume suspended channels */
+	if (chan->state != ARC_DMA_SUSPENDED) {
+		LOG_ERR("Channel %u not suspended, cannot resume (state=%d)", channel, chan->state);
+		k_spin_unlock(&data->lock, key);
+		return -EINVAL;
+	}
+
+	block = chan->config.head_block;
+	if (!block) {
+		LOG_ERR("No block configuration for channel %u", channel);
+		k_spin_unlock(&data->lock, key);
+		return -EINVAL;
+	}
+
+	attr = ARC_DMA_SET_DONE_ATTR | ARC_DMA_NP_ATTR;
+
+	/* Lock hardware access for this channel */
+	hw_key = k_spin_lock(&chan->hw_lock);
+
+	LOG_INF("Resuming HW transfer: ch=%u, src=0x%x, dst=0x%x, size=%u", channel,
+		(uint32_t)block->source_address, (uint32_t)block->dest_address, block->block_size);
+
+	/* Note: ARC DMA doesn't have hardware suspend/resume.
+	 * We restart the transfer from the beginning.
+	 */
+	dma_arc_hs_start_hw(channel, (const void *)block->source_address,
+			    (void *)block->dest_address, block->block_size, attr);
+
+	chan->handle = dma_arc_hs_get_handle_hw();
+	chan->active = true;
+	chan->state = ARC_DMA_ACTIVE;
+
+	LOG_INF("HW transfer resumed: ch=%u, handle=%u", channel, chan->handle);
+
+	k_spin_unlock(&chan->hw_lock, hw_key);
+
+	/* Schedule completion work to check for transfer completion */
+	k_work_schedule(&data->completion_work, K_MSEC(1));
+
+	k_spin_unlock(&data->lock, key);
+
+	LOG_DBG("Resumed DMA channel %u", channel);
+	return 0;
+}
+
+static void dma_arc_hs_completion_work_handler(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct arc_dma_data *data = CONTAINER_OF(dwork, struct arc_dma_data, completion_work);
+	const struct device *dev = data->dev;
+	const struct arc_dma_config *config = dev->config;
+	bool any_active = false;
+	int i;
+
+	/* Check all channels for completion */
+	for (i = 0; i < config->channels; i++) {
+		if (data->channels[i].active) {
+			any_active = true;
+			dma_arc_hs_check_completion(dev, i);
+		}
+	}
+
+	/* Reschedule work if there are still active transfers */
+	if (any_active) {
+		/* Poll every 1ms when transfers are active */
+		k_work_schedule(&data->completion_work, K_MSEC(1));
+	} else {
+		LOG_DBG("No active transfers, work handler idle");
+	}
 }
 
 static const struct dma_driver_api dma_arc_hs_api = {
 	.config = dma_arc_hs_config,
 	.start = dma_arc_hs_start,
 	.stop = dma_arc_hs_stop,
+	.suspend = dma_arc_hs_suspend,
+	.resume = dma_arc_hs_resume,
 	.get_status = dma_arc_hs_get_status,
 	.chan_filter = dma_arc_hs_chan_filter,
 	.chan_release = dma_arc_hs_chan_release,
@@ -539,8 +753,11 @@ static int dma_arc_hs_init(const struct device *dev)
 		data->channels[i].id = i;
 		data->channels[i].in_use = false;
 		data->channels[i].active = false;
+		data->channels[i].state = ARC_DMA_IDLE;
 		data->channels[i].callback = NULL;
 		data->channels[i].callback_arg = NULL;
+		data->channels[i].block_count = 0;
+		data->channels[i].blocks_completed = 0;
 		/* Spinlocks are zero-initialized by default in Zephyr */
 	}
 
@@ -550,17 +767,12 @@ static int dma_arc_hs_init(const struct device *dev)
 		dma_arc_hs_init_channel_hw(i, 0, config->descriptors - 1);
 	}
 
-	/* Start completion checking thread */
-	data->completion_thread_running = true;
-	data->completion_thread_id = k_thread_create(
-		&data->completion_thread, data->completion_stack,
-		K_KERNEL_STACK_SIZEOF(data->completion_stack), dma_arc_hs_completion_thread,
-		(void *)dev, NULL, NULL, K_PRIO_COOP(7), /* High priority thread */
-		0, K_NO_WAIT);
+	/* Initialize completion work queue */
+	data->dev = dev;
+	k_work_init_delayable(&data->completion_work, dma_arc_hs_completion_work_handler);
+	data->work_initialized = true;
 
-	k_thread_name_set(data->completion_thread_id, "arc_dma_completion");
-
-	LOG_INF("ARC DMA initialized successfully with completion thread");
+	LOG_INF("ARC DMA initialized successfully with work queue");
 	return 0;
 }
 
