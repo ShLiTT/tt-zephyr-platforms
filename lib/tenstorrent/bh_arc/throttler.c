@@ -11,6 +11,7 @@
 #include "aiclk_ppm.h"
 #include "cm2dm_msg.h"
 #include <zephyr/drivers/misc/bh_fwtable.h>
+#include <zephyr/tracing/tracing.h>
 #include "telemetry_internal.h"
 #include "telemetry.h"
 
@@ -142,6 +143,19 @@ static Throttler throttler[kThrottlerCount] = {
 	}
 };
 
+static const char *const throttler_trace_names[kThrottlerCount] = {
+	[kThrottlerTDP] = "tdp",
+	[kThrottlerFastTDC] = "f_tdc",
+	[kThrottlerTDC] = "tdc",
+	[kThrottlerThm] = "thm",
+	[kThrottlerBoardPower] = "pow",
+	[kThrottlerGDDRThm] = "d_thm",
+};
+
+/* Trace throttler events every N calls to reduce tracing overhead */
+#define THROTTLER_TRACE_PERIOD 1000
+static uint32_t throttler_trace_counter;
+
 static void SetThrottlerLimit(ThrottlerId id, float limit)
 {
 	float clamped_limit =
@@ -202,6 +216,19 @@ void CalculateThrottlers(void)
 
 	for (ThrottlerId i = 0; i < kThrottlerCount; i++) {
 		UpdateThrottlerArb(i);
+	}
+
+	/* Emit trace events periodically to reduce overhead */
+	throttler_trace_counter++;
+	if (throttler_trace_counter >= THROTTLER_TRACE_PERIOD) {
+		throttler_trace_counter = 0;
+		for (ThrottlerId i = 0; i < kThrottlerCount; i++) {
+			Throttler *t = &throttler[i];
+
+			sys_trace_named_event(throttler_trace_names[i], (uint32_t)t->limit,
+					      (uint32_t)t->value);
+			// printf("Throttler %s: limit: %d, value: %d\n", throttler_trace_names[i], (uint32_t)t->limit, (uint32_t)t->value);
+		}
 	}
 }
 
