@@ -324,6 +324,32 @@ static void wipe_l1(void)
 	}
 }
 
+/* Helper function to load configuration data from SPI flash */
+static int load_config_data(uint8_t *buf, size_t *image_size, size_t *spi_address)
+{
+	tt_boot_fs_fd tag_fd;
+	int rc;
+
+	rc = tt_boot_fs_find_fd_by_tag(flash, MRISC_FW_CFG_TAG, &tag_fd);
+	if (rc < 0) {
+		LOG_ERR("%s (%s) failed: %d", "tt_boot_fs_find_fd_by_tag", MRISC_FW_CFG_TAG, rc);
+		return rc;
+	}
+	*image_size = tag_fd.flags.f.image_size;
+	*spi_address = tag_fd.spi_addr;
+
+	__ASSERT(SCRATCHPAD_SIZE >= *image_size,
+		 "spi buffer size %zu must be larger than image size %zu", SCRATCHPAD_SIZE,
+		 *image_size);
+
+	rc = flash_read(flash, *spi_address, buf, *image_size);
+	if (rc < 0) {
+		LOG_ERR("%s() failed: %d", "flash_read", rc);
+		return rc;
+	}
+	return 0;
+}
+
 static int InitMrisc(void)
 {
 	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_INIT_STEP9);
@@ -368,23 +394,9 @@ static int InitMrisc(void)
 		}
 	}
 
-	rc = tt_boot_fs_find_fd_by_tag(flash, MRISC_FW_CFG_TAG, &tag_fd);
-	if (rc < 0) {
-		LOG_ERR("%s (%s) failed: %d", "tt_boot_fs_find_fd_by_tag", MRISC_FW_CFG_TAG, rc);
-		return rc;
-	}
-	image_size = tag_fd.flags.f.image_size;
-	spi_address = tag_fd.spi_addr;
-
-	/* Loading ETH FW configuration data requires the whole data to be loaded into buffer */
-	__ASSERT(SCRATCHPAD_SIZE >= image_size,
-		 "spi buffer size %zu must be larger than image size %zu", SCRATCHPAD_SIZE,
-		 image_size);
-
-	rc = flash_read(flash, spi_address, buf, image_size);
-	if (rc < 0) {
-		LOG_ERR("%s() failed: %d", "flash_read", rc);
-		return rc;
+	if (load_config_data(buf, &image_size, &spi_address) < 0) {
+		LOG_ERR("%s() failed: %d", "load_config_data", -EIO);
+		return -EIO;
 	}
 
 	uint32_t gddr_speed = GetGddrSpeedFromCfg(buf);
@@ -399,18 +411,6 @@ static int InitMrisc(void)
 		    (clock_control_subsys_rate_t)(gddr_speed / GDDR_SPEED_TO_MEMCLK_RATIO))) {
 		LOG_ERR("%s(%d) failed: %d", "SetGddrMemClk", gddr_speed, -EIO);
 		return -EIO;
-	}
-
-	for (uint8_t gddr_inst = 0; gddr_inst < NUM_GDDR; gddr_inst++) {
-		if (IS_BIT_SET(dram_mask, gddr_inst)) {
-			if (LoadMriscFwCfg(gddr_inst, buf, SCRATCHPAD_SIZE, spi_address,
-					   image_size)) {
-				LOG_ERR("%s(%d) failed: %d", "LoadMriscFwCfg", gddr_inst, -EIO);
-				return -EIO;
-			}
-			MriscRegWrite32(gddr_inst, MRISC_INIT_STATUS, MRISC_INIT_BEFORE);
-			ReleaseMriscReset(gddr_inst);
-		}
 	}
 
 	return 0;
@@ -491,29 +491,78 @@ static int gddr_training(void)
 		return 0;
 	}
 
+	uint32_t dram_mask = GetDramMask();
+	size_t image_size;
+	size_t spi_address;
+	uint8_t buf[SCRATCHPAD_SIZE] __aligned(4);
 	bool init_errors = false;
-	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(MRISC_INIT_TIMEOUT));
+	int final_error = 0;
+
+	/* Re-read Config Data */
+	if (load_config_data(buf, &image_size, &spi_address)) {
+		return -EIO;
+	}
 
 	for (uint8_t gddr_inst = 0; gddr_inst < NUM_GDDR; gddr_inst++) {
-		if (IS_BIT_SET(GetDramMask(), gddr_inst)) {
-			int error = CheckGddrTraining(gddr_inst, timeout);
+		if (IS_BIT_SET(dram_mask, gddr_inst)) {
+			LOG_INF("Starting sequential init for GDDR controller %d...", gddr_inst);
+			/* A. Load Config (Sequential) */
+			if (LoadMriscFwCfg(gddr_inst, buf, SCRATCHPAD_SIZE, spi_address,
+				image_size)) {
+				LOG_ERR("%s(%d) failed: %d", "LoadMriscFwCfg", gddr_inst, -EIO);
+				return -EIO;
+			}
+
+			/* B. Start Training (Release Reset) */
+			MriscRegWrite32(gddr_inst, MRISC_INIT_STATUS, MRISC_INIT_BEFORE);
+			ReleaseMriscReset(gddr_inst);
+
+			/* C. Wait for Training */
+			k_timepoint_t init_timeout = sys_timepoint_calc(K_MSEC(MRISC_INIT_TIMEOUT));
+			int error = CheckGddrTraining(gddr_inst, init_timeout);
 
 			if (error == -ETIMEDOUT) {
 				LOG_ERR("GDDR instance %d timed out during training", gddr_inst);
 				init_errors = true;
+				continue;
 			} else if (error) {
 				LOG_ERR("GDDR instance %d failed training", gddr_inst);
 				init_errors = true;
+				continue;
+			}
+
+			/* D. Run & Wait for Memtest */
+			error = StartHwMemtest(gddr_inst, 26, 0, 0);
+			k_timepoint_t memtest_timeout =
+				sys_timepoint_calc(K_MSEC(MRISC_MEMTEST_TIMEOUT));
+
+			if (error == -ENOTSUP) {
+				/* Shouldn't be considered a test failure if MRISC FW is too old. */
+				LOG_DBG("%s(%d) %s: %d", "StartHwMemtest", gddr_inst, "skipped",
+					error);
+			} else if (error < 0) {
+				LOG_ERR("%s(%d) %s: %d", "StartHwMemtest", gddr_inst, "failed",
+					error);
+				final_error = -EIO;
+			} else {
+				error = CheckHwMemtestResult(gddr_inst, memtest_timeout);
+
+				if (error < 0) {
+					final_error = -EIO;
+					LOG_ERR("%s(%d) %s: %d", "CheckHwMemtestResult", gddr_inst,
+						"failed", error);
+				} else {
+					LOG_DBG("%s(%d) %s: %d", "CheckHwMemtestResult", gddr_inst,
+						"succeeded", error);
+				}
 			}
 		}
 	}
 
-	if (!init_errors) {
-		/* this is needed to securely wipe DRAM */
-		if (CheckGddrHwTest() < 0) {
-			LOG_ERR("GDDR HW test failed");
-			return -EIO;
-		}
+	/* If we had training errors or memtest errors, return failure */
+	if (init_errors || final_error) {
+		LOG_ERR("GDDR HW test failed");
+		return -EIO;
 	}
 
 	return 0;

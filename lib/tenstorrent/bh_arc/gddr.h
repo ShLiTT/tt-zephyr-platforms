@@ -31,8 +31,8 @@
 #define MRISC_INIT_FAILED              0xfa11
 #define MRISC_INIT_BEFORE              0x11111111
 #define MRISC_INIT_STARTED             0x0
-#define MRISC_INIT_TIMEOUT             1000 /* In ms */
-#define MRISC_MEMTEST_TIMEOUT          1000 /* In ms */
+#define MRISC_INIT_TIMEOUT             2000 /* In ms */
+#define MRISC_MEMTEST_TIMEOUT          2000 /* In ms */
 #define MRISC_POWER_SETTING_TIMEOUT_MS 1000
 
 /* Defined by MRISC FW */
